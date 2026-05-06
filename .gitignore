@@ -3,3 +3,4 @@
 *.txt
 !pyrightconfig.json
 __pycache__/
+*.log
