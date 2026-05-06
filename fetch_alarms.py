@@ -810,7 +810,7 @@ def index_entity_events_to_elasticsearch(
                 error_count += 1
                 continue
 
-            response = es_client.index(index=ES_INDEX, id=record_id, document=doc)
+            response = es_client.index(index=ES_INDEX, document=doc)
 
             if response.get("result") in ["created", "updated"]:
                 success_count += 1
