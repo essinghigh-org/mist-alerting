@@ -598,6 +598,13 @@ def prepare_entity_event_document(
     if record_details:
         doc.update(record_details)
 
+    event_name = str(event.get("event_name", doc.get("event_type", "unknown")))
+    event_type = str(doc.get("event_type", event_name))
+    doc["type_raw"] = event_name
+    doc["type"] = event_name.replace("_", " ").title()
+    doc["event_type"] = event_type
+    doc["group"] = "infrastructure"
+
     site_id = doc.get("site_id")
     doc.update(get_site_enrichment(site_id, site_mapping, site_details))
 
