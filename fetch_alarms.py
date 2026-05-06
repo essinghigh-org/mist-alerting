@@ -605,6 +605,7 @@ def prepare_entity_event_document(
     if entity_id:
         doc["entity_mac"] = entity_id
 
+    doc["severity"] = "warning"
     doc["source"] = "mist_labs_entity_events"
     doc["submitter_hostname"] = socket.gethostname()
     doc["submitter_path"] = os.path.abspath(__file__)
@@ -616,6 +617,24 @@ def prepare_entity_event_document(
         doc["@timestamp"] = datetime.fromtimestamp(end_time / 1000).isoformat()
 
     return doc
+
+
+def flatten_named_values(value: Any) -> Any:
+    """Recursively flatten Mist's list of name/value objects into dictionaries."""
+    if isinstance(value, list):
+        flattened: Dict[str, Any] = {}
+        raw_items = cast(List[Any], value)
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                return raw_items
+            item = cast(Dict[str, Any], raw_item)
+            name = item.get("name")
+            if not name or "value" not in item:
+                return raw_items
+            flattened[str(name)] = flatten_named_values(item.get("value"))
+        return flattened
+
+    return value
 
 
 def flatten_entity_event_record(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -645,12 +664,12 @@ def flatten_entity_event_record(record: Dict[str, Any]) -> Dict[str, Any]:
                 detail_name = detail.get("name")
                 detail_value = detail.get("value")
                 if detail_name:
-                    details[str(detail_name)] = detail_value
+                    details[str(detail_name)] = flatten_named_values(detail_value)
                 raw_details.append(detail)
             flattened["details"] = details
             flattened["details_raw"] = raw_details
         else:
-            flattened[str(name)] = value
+            flattened[str(name)] = flatten_named_values(value)
 
     return flattened
 

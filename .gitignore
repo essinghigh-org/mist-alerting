@@ -2,3 +2,4 @@
 *.json
 *.txt
 !pyrightconfig.json
+__pycache__/
