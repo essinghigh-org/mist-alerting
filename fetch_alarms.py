@@ -663,7 +663,6 @@ def flatten_entity_event_record(record: Dict[str, Any]) -> Dict[str, Any]:
         value = item.get("value")
         if name == "details" and isinstance(value, list):
             details: Dict[str, Any] = {}
-            raw_details: List[Dict[str, Any]] = []
             for raw_detail in cast(List[Any], value):
                 if not isinstance(raw_detail, dict):
                     continue
@@ -672,9 +671,7 @@ def flatten_entity_event_record(record: Dict[str, Any]) -> Dict[str, Any]:
                 detail_value = detail.get("value")
                 if detail_name:
                     details[str(detail_name)] = flatten_named_values(detail_value)
-                raw_details.append(detail)
             flattened["details"] = details
-            flattened["details_raw"] = raw_details
         else:
             flattened[str(name)] = flatten_named_values(value)
 
