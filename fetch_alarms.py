@@ -51,6 +51,7 @@ ALARM_DEFS_ENDPOINT = f"{MIST_API_BASE}/const/alarm_defs"
 SITES_ENDPOINT = f"{MIST_API_BASE}/orgs/{MIST_ORG_ID}/sites"
 SITEGROUPS_ENDPOINT = f"{MIST_API_BASE}/orgs/{MIST_ORG_ID}/sitegroups"
 ENTITY_EVENTS_ENDPOINT = f"{MIST_API_BASE}/labs/orgs/{MIST_ORG_ID}/entity_events"
+INVENTORY_ENDPOINT = f"{MIST_API_BASE}/orgs/{MIST_ORG_ID}/inventory"
 
 # State file
 LAST_TIMESTAMP_FILE = "last_alarm_timestamp.txt"
@@ -61,6 +62,7 @@ ALARM_DEFINITIONS_CACHE = "alarm_definitions.json"
 SITE_MAPPING_CACHE = "site_mapping.json"
 SITE_DETAILS_CACHE = "site_details.json"
 SITEGROUP_MAPPING_CACHE = "sitegroup_mapping.json"
+INVENTORY_CACHE = "inventory_mapping.json"
 
 # Severity order for display
 SEVERITY_ORDER = ["critical", "major", "minor", "warn", "info"]
@@ -71,6 +73,9 @@ MAX_RESULTS = 1000
 API_MAX_RETRIES = 3
 API_RETRY_STATUSES = {429, 500, 502, 503, 504}
 ENTITY_EVENT_RECORD_DELAY_SECONDS = 0.1
+CACHE_REFRESH_DAYS = 1
+CACHE_REFRESH_START_HOUR = 23
+CACHE_REFRESH_END_HOUR = 2
 
 # ============================================================================
 # State Management
@@ -109,6 +114,46 @@ def mist_get(
         time.sleep(delay)
 
     raise RuntimeError("Mist API request retry loop exited unexpectedly")
+
+
+def normalize_mac(mac: Any) -> Optional[str]:
+    """Normalize MAC addresses to Mist's lowercase 12-character format."""
+    if not mac:
+        return None
+
+    normalized = "".join(char for char in str(mac).lower() if char.isalnum())
+    return normalized or None
+
+
+def is_cache_stale(path: str, max_age_days: int = CACHE_REFRESH_DAYS) -> bool:
+    """Return whether a cache file is missing or older than the configured age."""
+    try:
+        modified_time = datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return True
+
+    return datetime.now() - modified_time > timedelta(days=max_age_days)
+
+
+def is_cache_refresh_window(now: Optional[datetime] = None) -> bool:
+    """Return whether current local time is inside the overnight refresh window."""
+    current_hour = (now or datetime.now()).hour
+
+    if CACHE_REFRESH_START_HOUR <= CACHE_REFRESH_END_HOUR:
+        return CACHE_REFRESH_START_HOUR <= current_hour <= CACHE_REFRESH_END_HOUR
+
+    return (
+        current_hour >= CACHE_REFRESH_START_HOUR
+        or current_hour <= CACHE_REFRESH_END_HOUR
+    )
+
+
+def should_refresh_cache(path: str) -> bool:
+    """Refresh missing caches immediately, stale caches only overnight."""
+    if not os.path.exists(path):
+        return True
+
+    return is_cache_stale(path) and is_cache_refresh_window()
 
 
 def get_last_processed_timestamp() -> int:
@@ -300,9 +345,11 @@ def load_sitegroup_mapping() -> Dict[str, str]:
     return sitegroup_mapping
 
 
-def fetch_sitegroups_if_needed(sitegroup_mapping: Dict[str, str]) -> bool:
+def fetch_sitegroups_if_needed(
+    sitegroup_mapping: Dict[str, str], force: bool = False
+) -> bool:
     """Fetch site group names if not already cached."""
-    if sitegroup_mapping:
+    if sitegroup_mapping and not force:
         return False
 
     print("Fetching site group mapping...")
@@ -329,6 +376,7 @@ def fetch_sitegroups_if_needed(sitegroup_mapping: Dict[str, str]) -> bool:
 
         sitegroups_data = response.json()
         if isinstance(sitegroups_data, list):
+            sitegroup_mapping.clear()
             for sitegroup in sitegroups_data:  # type: ignore[assignment]
                 sitegroup_id = sitegroup.get("id")  # type: ignore[assignment]
                 sitegroup_name = sitegroup.get("name")  # type: ignore[assignment]
@@ -370,17 +418,21 @@ def fetch_sites_if_needed(
     site_mapping: Dict[str, str],
     site_details: Dict[str, Dict[str, Any]],
     sitegroup_mapping: Dict[str, str],
+    force: bool = False,
 ) -> bool:
     """Fetch sites data if we have missing site IDs."""
-    if not missing_site_ids:
+    if not missing_site_ids and not force:
         return False
 
-    fetch_sitegroups_if_needed(sitegroup_mapping)
+    fetch_sitegroups_if_needed(sitegroup_mapping, force=force)
 
-    print(
-        f"Found {len(missing_site_ids)} unknown site IDs, fetching updated sites"
-        " data..."
-    )
+    if force:
+        print("Refreshing site mapping and site details...")
+    else:
+        print(
+            f"Found {len(missing_site_ids)} unknown site IDs, fetching updated sites"
+            " data..."
+        )
 
     sites_params = {"limit": MAX_RESULTS, "page": 1}
     headers = {
@@ -402,6 +454,9 @@ def fetch_sites_if_needed(
 
         sites_data = sites_response.json()
         if isinstance(sites_data, list):
+            if force:
+                site_mapping.clear()
+                site_details.clear()
             for raw_site in cast(List[Any], sites_data):
                 if not isinstance(raw_site, dict):
                     continue
@@ -452,6 +507,111 @@ def get_site_name(site_id: Optional[str], site_mapping: Dict[str, str]) -> str:
     if site_id:
         return site_mapping.get(site_id, site_id)
     return "N/A"
+
+
+def load_inventory_mapping() -> Dict[str, Dict[str, Any]]:
+    """Load cached org inventory keyed by normalized device MAC."""
+    inventory_mapping: Dict[str, Dict[str, Any]] = {}
+    try:
+        with open(INVENTORY_CACHE, "r") as f:
+            inventory_mapping = json.load(f)
+        print(f"Loaded inventory mapping for {len(inventory_mapping)} devices")
+    except FileNotFoundError:
+        print("No existing inventory mapping found. Will fetch inventory as needed.")
+    except json.JSONDecodeError:
+        print("Warning: Could not parse inventory_mapping.json. Will fetch inventory.")
+    return inventory_mapping
+
+
+def fetch_inventory_if_needed(
+    inventory_mapping: Dict[str, Dict[str, Any]], force: bool = False
+) -> bool:
+    """Fetch paginated org inventory if cache is absent or due for refresh."""
+    if inventory_mapping and not force:
+        return False
+
+    print("Fetching org inventory...")
+
+    headers = {
+        "Authorization": f"Token {MIST_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    fetched_inventory: Dict[str, Dict[str, Any]] = {}
+    page = 1
+
+    try:
+        while True:
+            response = mist_get(
+                INVENTORY_ENDPOINT,
+                headers=headers,
+                params={"limit": MAX_RESULTS, "page": page},
+                timeout=API_TIMEOUT,
+            )
+
+            if response.status_code != 200:
+                print(
+                    "Warning: Could not fetch org inventory (status"
+                    f" {response.status_code})"
+                )
+                return False
+
+            inventory_data = response.json()
+            if not isinstance(inventory_data, list):
+                return False
+
+            inventory_items = cast(List[Any], inventory_data)
+            for raw_item in inventory_items:
+                if not isinstance(raw_item, dict):
+                    continue
+                item = cast(Dict[str, Any], raw_item)
+                normalized_mac = normalize_mac(item.get("mac"))
+                if not normalized_mac:
+                    continue
+
+                fetched_inventory[normalized_mac] = {
+                    "mac": normalized_mac,
+                    "name": item.get("name"),
+                    "type": item.get("type"),
+                    "model": item.get("model"),
+                    "serial": item.get("serial"),
+                    "site_id": item.get("site_id"),
+                    "id": item.get("id"),
+                }
+
+            if len(inventory_items) < MAX_RESULTS:
+                break
+            page += 1
+
+        inventory_mapping.clear()
+        inventory_mapping.update(fetched_inventory)
+
+        with open(INVENTORY_CACHE, "w") as f:
+            json.dump(inventory_mapping, f, indent=2)
+
+        print(f"Updated inventory mapping to {len(inventory_mapping)} devices")
+        return True
+
+    except Exception as e:
+        print(f"Warning: Could not fetch org inventory: {e}")
+
+    return False
+
+
+def get_inventory_hostname(
+    mac: Any, inventory_mapping: Dict[str, Dict[str, Any]]
+) -> Optional[str]:
+    """Return a device name from inventory for a MAC address."""
+    normalized_mac = normalize_mac(mac)
+    if not normalized_mac:
+        return None
+
+    inventory_item = inventory_mapping.get(normalized_mac)
+    if not inventory_item:
+        return None
+
+    name = inventory_item.get("name")
+    return str(name) if name else None
 
 
 # ============================================================================
@@ -585,6 +745,7 @@ def prepare_entity_event_document(
     event: Dict[str, Any],
     site_mapping: Dict[str, str],
     site_details: Dict[str, Dict[str, Any]],
+    inventory_mapping: Dict[str, Dict[str, Any]],
     record_details: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Prepare an experimental entity event document for Elasticsearch indexing."""
@@ -612,7 +773,21 @@ def prepare_entity_event_document(
     if entity_id:
         doc["entity_mac"] = entity_id
 
-    doc["severity"] = "warning"
+    hostnames: List[str] = []
+    for mac_field in ("entity_id", "record_entity_id", "ap_mac", "switch_mac"):
+        hostname = get_inventory_hostname(doc.get(mac_field), inventory_mapping)
+        if hostname and hostname not in hostnames:
+            hostnames.append(hostname)
+
+    for name_field in ("switch_name", "sys_name"):
+        fallback_hostname = doc.get(name_field)
+        if fallback_hostname and str(fallback_hostname) not in hostnames:
+            hostnames.append(str(fallback_hostname))
+
+    if hostnames:
+        doc["hostnames"] = hostnames
+
+    doc["severity"] = "warn"
     doc["source"] = "mist_labs_entity_events"
     doc["submitter_hostname"] = socket.gethostname()
     doc["submitter_path"] = os.path.abspath(__file__)
@@ -766,6 +941,7 @@ def index_entity_events_to_elasticsearch(
     events: List[Dict[str, Any]],
     site_mapping: Dict[str, str],
     site_details: Dict[str, Dict[str, Any]],
+    inventory_mapping: Dict[str, Dict[str, Any]],
     last_processed_timestamp: int,
     es_client: Optional[Elasticsearch],
 ) -> None:
@@ -803,7 +979,7 @@ def index_entity_events_to_elasticsearch(
                 time.sleep(ENTITY_EVENT_RECORD_DELAY_SECONDS)
 
             doc = prepare_entity_event_document(
-                event, site_mapping, site_details, record_details
+                event, site_mapping, site_details, inventory_mapping, record_details
             )
             if not doc:
                 print(f"Warning: Entity event missing record_id, skipping: {event}")
@@ -1078,7 +1254,21 @@ def main() -> None:
     site_mapping = load_site_mapping()
     site_details = load_site_details()
     sitegroup_mapping = load_sitegroup_mapping()
+    inventory_mapping = load_inventory_mapping()
     es_client = init_elasticsearch_client()
+
+    refresh_site_cache = (
+        should_refresh_cache(SITE_MAPPING_CACHE)
+        or should_refresh_cache(SITE_DETAILS_CACHE)
+        or should_refresh_cache(SITEGROUP_MAPPING_CACHE)
+    )
+    if refresh_site_cache:
+        fetch_sites_if_needed(
+            set(), site_mapping, site_details, sitegroup_mapping, force=True
+        )
+
+    if not inventory_mapping or should_refresh_cache(INVENTORY_CACHE):
+        fetch_inventory_if_needed(inventory_mapping, force=True)
 
     data = fetch_alarms(start_timestamp, end_timestamp)
     entity_events_data = fetch_entity_events(start_timestamp, end_timestamp)
@@ -1146,6 +1336,7 @@ def main() -> None:
         entity_event_results,
         site_mapping,
         site_details,
+        inventory_mapping,
         last_processed_entity_event_timestamp,
         es_client,
     )
